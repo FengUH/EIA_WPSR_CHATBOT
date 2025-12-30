@@ -16,6 +16,23 @@ spec.loader.exec_module(answer_hl)
 
 # ================== 复用后端逻辑 ==================
 
+def _call_llm_backend(prompt: str) -> str:
+    """
+    统一的 LLM 调用入口：
+      - 如果 04_answer_question_4highlights.py 里设置了 USE_LOCAL_LLM=True，
+        则调用本地 Ollama (call_local_llm)
+      - 否则调用云端 GPT (call_gpt_llm)
+    这样只改这一处，就能保持原 app.py 的所有表现方式不变。
+    """
+    use_local = getattr(answer_hl, "USE_LOCAL_LLM", False)
+    if use_local:
+        print("[INFO] Using local Llama backend from app.py")
+        return answer_hl.call_local_llm(prompt)
+    else:
+        print("[INFO] Using cloud GPT backend from app.py")
+        return answer_hl.call_gpt_llm(prompt)
+
+
 def answer_question_ui(question: str, top_k: int = 6, weeks_back: int = 12) -> str:
     conn = answer_hl.sf_connect()
     try:
@@ -29,7 +46,8 @@ def answer_question_ui(question: str, top_k: int = 6, weeks_back: int = 12) -> s
         conn.close()
 
     prompt = answer_hl.build_prompt(question, chunks)
-    answer = answer_hl.call_local_llm(prompt)
+    # ⭐ 这里改成调用统一入口（内部再决定本地 / GPT）
+    answer = _call_llm_backend(prompt)
     return answer
 
 
@@ -56,7 +74,8 @@ def answer_question_ui_with_timing(
     prompt = answer_hl.build_prompt(question, chunks)
     t3 = time.time()
 
-    answer = answer_hl.call_local_llm(prompt)
+    # ⭐ 这里也改成统一入口（保留原 timing 结构）
+    answer = _call_llm_backend(prompt)
     t4 = time.time()
 
     timings = {

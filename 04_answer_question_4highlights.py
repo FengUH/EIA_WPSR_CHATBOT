@@ -4,15 +4,27 @@ import requests
 import re
 import streamlit as st
 import json
+import os
 
 import snowflake.connector
 from snowflake_config import SF_CONFIG
+
+from openai import OpenAI  # ✅ 新增：OpenAI 官方 SDK
 
 # 向量检索仍然用 Cortex 的 embedding 模型
 EMBED_MODEL = "snowflake-arctic-embed-l-v2.0"
 
 # 相似度阈值：低于这个值就认为“和 WPSR Highlights 不相关”
 SIMILARITY_THRESHOLD = 0.25
+
+# LLM 选择：
+# - 默认使用云端 GPT（gpt-4o-mini）
+# - 如果你在本地 export USE_LOCAL_LLM=1，则改用本地 Ollama Llama3
+USE_LOCAL_LLM = os.getenv("USE_LOCAL_LLM", "0") == "1"
+
+# 默认 GPT 模型名（性价比高）
+DEFAULT_GPT_MODEL = os.getenv("GPT_MODEL_NAME", "gpt-4o-mini")
+
 
 # =========================================================
 # 从 WPSR Highlights 样板中提取的关键词（再加一些通用词）
@@ -430,11 +442,63 @@ Now produce the ANSWER and SUPPORTING_SENTENCES following the rules and format a
     return textwrap.dedent(prompt).strip()
 
 
-# ---------- 用 LLM 生成回答 ----------
+# ---------- GPT 云端 LLM ----------
+
+def _get_openai_client() -> OpenAI:
+    """
+    从环境变量或 Streamlit secrets 中获取 OPENAI_API_KEY，
+    并返回一个 OpenAI 客户端。如果没有配置，抛出友好错误。
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    # 如果环境变量没有，尝试从 st.secrets 读取（本地/.streamlit 或云端 Secrets）
+    if not api_key:
+        try:
+            api_key = st.secrets.get("OPENAI_API_KEY", None)
+        except Exception:
+            api_key = None
+
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. Please configure it either as an "
+            "environment variable or in Streamlit secrets."
+        )
+
+    return OpenAI(api_key=api_key)
+
+
+def call_gpt_llm(prompt: str, model: str = None) -> str:
+    """
+    调用云端 GPT 模型（默认 gpt-4o-mini），用于 Streamlit Cloud 等环境。
+    """
+    if model is None:
+        model = DEFAULT_GPT_MODEL
+
+    client = _get_openai_client()
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an energy market analyst specialized in the "
+                    "EIA Weekly Petroleum Status Report (WPSR) Highlights."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content
+
+
+# ---------- 本地 Ollama LLM（可选） ----------
 
 def call_local_llm(prompt: str) -> str:
     """
-    调用本地 Ollama Llama3.2 (3B) 模型（保持流式，函数仍返回完整文本）
+    调用本地 Ollama Llama3.2 (3B) 模型。
+    只有在设置 USE_LOCAL_LLM=1 时才会被使用。
     """
     url = "http://localhost:11434/api/generate"
     payload = {
@@ -486,8 +550,22 @@ def answer_question(question: str, top_k: int = 4, weeks_back: int = 8):
     # 2) 构建 prompt（如果 chunks 为空，会自动走 "I don't know" 模式）
     prompt = build_prompt(question, chunks)
 
-    # 3) 生成回答
-    answer = call_local_llm(prompt)
+    # 3) 生成回答：优先用云端 GPT；如果你设置了 USE_LOCAL_LLM=1，则用本地 Llama
+    try:
+        if USE_LOCAL_LLM:
+            print("[INFO] Using local Llama3 (Ollama) as LLM backend.")
+            answer = call_local_llm(prompt)
+        else:
+            print(f"[INFO] Using cloud GPT model '{DEFAULT_GPT_MODEL}' as LLM backend.")
+            answer = call_gpt_llm(prompt)
+    except RuntimeError as e:
+        # OPENAI_API_KEY 未配置等错误
+        err_msg = f"LLM configuration error: {e}"
+        print(f"[ERROR] {err_msg}")
+        return err_msg
+    except Exception as e:
+        print(f"[ERROR] Unexpected error when calling LLM: {e}")
+        return f"Error while answering: {e}"
 
     print("\n================= MODEL ANSWER =================\n")
     print(answer)
